@@ -145,7 +145,7 @@ stdenv.mkDerivation {
         ln -s $ldPath/${targetPrefix}as $out/bin/${targetPrefix}as
       fi
 
-    '' + (if !useMacosReexportHack then ''
+    '' + (if !useMacosReexportHack then optionalString (!targetPlatform.isDarwin) ''
       wrap ${targetPrefix}ld ${./ld-wrapper.sh} ''${ld:-$ldPath/${targetPrefix}ld}
     '' else ''
       ldInner="${targetPrefix}ld-reexport-delegate"
