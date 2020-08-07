@@ -11,7 +11,7 @@
 , libtiff, librsvg, gconf, libxml2, imagemagick, gnutls, libselinux
 , alsaLib, cairo, acl, gpm, AppKit, GSS, ImageIO, m17n_lib, libotf
 , jansson, harfbuzz
-, libgccjit, targetPlatform, binutils, binutils-unwrapped, makeWrapper # native-comp params
+, libgccjit, targetPlatform, binutils, clang ? null, binutils-unwrapped, makeWrapper # native-comp params
 , systemd ? null
 , withX ? !stdenv.isDarwin
 , withNS ? stdenv.isDarwin
@@ -67,18 +67,18 @@ in stdenv.mkDerivation {
 
     # Make native compilation work both inside and outside of nix build
     (lib.optionalString nativeComp (let
-      libPath = lib.concatStringsSep ":" [
-        "${lib.getLib libgccjit}/lib/gcc/${targetPlatform.config}/${libgccjit.version}"
-        "${lib.getLib stdenv.cc.cc}/lib"
-        "${lib.getLib stdenv.libc}/lib"
-      ];
+      libPath = (lib.concatStringsSep " "
+        (builtins.map (x: ''\"-L${x}\"'') [
+          "${lib.getLib libgccjit}/lib"
+          "${lib.getLib libgccjit}/lib/gcc/${targetPlatform.config}/${libgccjit.version}"
+          "${lib.getLib stdenv.cc.cc}/lib"
+          "${lib.getLib stdenv.libc}/lib"
+        ]));
     in ''
       substituteInPlace lisp/emacs-lisp/comp.el --replace \
-        "(defcustom comp-async-env-modifier-form nil" \
-        "(defcustom comp-async-env-modifier-form '((setenv \"LIBRARY_PATH\" (string-join (seq-filter (lambda (v) (null (eq v nil))) (list (getenv \"LIBRARY_PATH\") \"${libPath}\")) \":\")))"
-
+        "(defcustom comp-native-driver-options nil" \
+        "(defcustom comp-native-driver-options '(${libPath})"
     ''))
-
     ""
   ];
 
@@ -158,7 +158,7 @@ in stdenv.mkDerivation {
     '')
 
     (lib.optionalString nativeComp ''
-      wrapProgram $out/bin/emacs-* --prefix PATH : "${lib.makeBinPath [ binutils binutils-unwrapped ]}"
+      wrapProgram $out/bin/emacs-* --prefix PATH : "${lib.makeBinPath [ clang.bintools binutils binutils-unwrapped ]}"
     '')
 
   ];
