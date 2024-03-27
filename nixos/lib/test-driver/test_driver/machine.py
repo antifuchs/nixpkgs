@@ -211,6 +211,7 @@ class StartCommand:
             shell=True,
             cwd=state_dir,
             env=self.build_environment(state_dir, shared_dir),
+            pipesize=1024 * 1024,
         )
 
 
