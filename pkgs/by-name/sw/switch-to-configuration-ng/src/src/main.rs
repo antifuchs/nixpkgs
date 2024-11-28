@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -497,6 +498,120 @@ fn compare_units(current_unit: &UnitInfo, new_unit: &UnitInfo) -> UnitComparison
     ret
 }
 
+enum ActivationAction {
+    Stop,
+    Start,
+    Reload,
+    Restart,
+    Skip,
+    Filter,
+}
+
+impl ActivationAction {
+    fn persist_to(&self) -> Option<&str> {
+        match self {
+            Self::Start => Some(START_LIST_FILE),
+            Self::Restart => Some(RESTART_LIST_FILE),
+            Self::Reload => Some(RELOAD_LIST_FILE),
+            _ => None,
+        }
+    }
+}
+
+struct ActivationTasks {
+    units_to_stop: HashSet<String>,
+    units_to_start: HashSet<String>,
+    units_to_reload: HashSet<String>,
+    units_to_restart: HashSet<String>,
+    units_to_skip: HashSet<String>,
+    units_to_filter: HashSet<String>,
+}
+
+impl ActivationTasks {
+    fn new() -> Self {
+        Self {
+            units_to_stop: HashSet::new(),
+            units_to_start: map_from_list_file(START_LIST_FILE),
+            units_to_reload: map_from_list_file(RELOAD_LIST_FILE),
+            units_to_restart: map_from_list_file(RESTART_LIST_FILE),
+            units_to_skip: HashSet::new(),
+            units_to_filter: HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, unit: &str, action: ActivationAction) {
+        match action {
+            ActivationAction::Stop => self.units_to_stop.insert(unit.to_string()),
+            ActivationAction::Start => self.units_to_start.insert(unit.to_string()),
+            ActivationAction::Reload => self.units_to_reload.insert(unit.to_string()),
+            ActivationAction::Restart => self.units_to_restart.insert(unit.to_string()),
+            ActivationAction::Skip => self.units_to_skip.insert(unit.to_string()),
+            ActivationAction::Filter => self.units_to_filter.insert(unit.to_string()),
+        };
+        if let Some(path) = action.persist_to() {
+            record_unit(path, unit);
+        }
+    }
+
+    fn remove(&mut self, unit: &str, action: ActivationAction) {
+        match action {
+            ActivationAction::Stop => self.units_to_stop.remove(unit),
+            ActivationAction::Start => self.units_to_start.remove(unit),
+            ActivationAction::Reload => self.units_to_reload.remove(unit),
+            ActivationAction::Restart => self.units_to_restart.remove(unit),
+            ActivationAction::Skip => self.units_to_skip.remove(unit),
+            ActivationAction::Filter => self.units_to_filter.remove(unit),
+        };
+        if let Some(path) = action.persist_to() {
+            unrecord_unit(path, unit);
+        }
+    }
+
+    fn has_action(&self, unit: &str, action: ActivationAction) -> bool {
+        match action {
+            ActivationAction::Stop => self.units_to_stop.contains(unit),
+            ActivationAction::Start => self.units_to_start.contains(unit),
+            ActivationAction::Reload => self.units_to_reload.contains(unit),
+            ActivationAction::Restart => self.units_to_restart.contains(unit),
+            ActivationAction::Skip => self.units_to_skip.contains(unit),
+            ActivationAction::Filter => self.units_to_filter.contains(unit),
+        }
+    }
+
+    /// Returns the set of units to stop, minus the units to filter.
+    fn to_stop_filtered(&self) -> HashSet<&str> {
+        self.units_to_stop
+            .difference(&self.units_to_filter)
+            .map(|s| s.as_ref())
+            .collect()
+    }
+
+    /// Returns the set of units to start, minus the units to filter.
+    fn to_start_filtered(&self) -> HashSet<&str> {
+        self.units_to_start
+            .difference(&self.units_to_filter)
+            .map(|s| s.as_ref())
+            .collect()
+    }
+
+    fn to_stop(&self) -> &HashSet<String> {
+        &self.units_to_stop
+    }
+
+    fn to_skip(&self) -> &HashSet<String> {
+        &self.units_to_skip
+    }
+    fn to_start(&self) -> &HashSet<String> {
+        &self.units_to_start
+    }
+    fn to_restart(&self) -> &HashSet<String> {
+        &self.units_to_restart
+    }
+    fn to_reload(&self) -> &HashSet<String> {
+        &self.units_to_reload
+    }
+}
+
 // Called when a unit exists in both the old systemd and the new system and the units differ. This
 // figures out of what units are to be stopped, restarted, reloaded, started, and skipped.
 fn handle_modified_unit(
@@ -507,11 +622,7 @@ fn handle_modified_unit(
     new_base_unit_file: &Path,
     new_unit_info: Option<&UnitInfo>,
     active_cur: &HashMap<String, UnitState>,
-    units_to_stop: &mut HashMap<String, ()>,
-    units_to_start: &mut HashMap<String, ()>,
-    units_to_reload: &mut HashMap<String, ()>,
-    units_to_restart: &mut HashMap<String, ()>,
-    units_to_skip: &mut HashMap<String, ()>,
+    activation_tasks: &mut ActivationTasks,
 ) -> Result<()> {
     let use_restart_as_stop_and_start = new_unit_info.is_none();
 
@@ -532,11 +643,9 @@ fn handle_modified_unit(
         // means that we may not get all changes into the running system but it's better than
         // crashing it.
         if unit == "-.mount" || unit == "nix.mount" {
-            units_to_reload.insert(unit.to_string(), ());
-            record_unit(RELOAD_LIST_FILE, unit);
+            activation_tasks.add(unit, ActivationAction::Reload);
         } else {
-            units_to_restart.insert(unit.to_string(), ());
-            record_unit(RESTART_LIST_FILE, unit);
+            activation_tasks.add(unit, ActivationAction::Restart);
         }
     } else if unit.ends_with(".socket") {
         // FIXME: do something?
@@ -552,20 +661,19 @@ fn handle_modified_unit(
         };
 
         if parse_systemd_bool(new_unit_info, "Service", "X-ReloadIfChanged", false)
-            && !units_to_restart.contains_key(unit)
+            && !activation_tasks.has_action(unit, ActivationAction::Restart)
             && !(if use_restart_as_stop_and_start {
-                units_to_restart.contains_key(unit)
+                activation_tasks.has_action(unit, ActivationAction::Restart)
             } else {
-                units_to_stop.contains_key(unit)
+                activation_tasks.has_action(unit, ActivationAction::Stop)
             })
         {
-            units_to_reload.insert(unit.to_string(), ());
-            record_unit(RELOAD_LIST_FILE, unit);
+            activation_tasks.add(unit, ActivationAction::Reload);
         } else if !parse_systemd_bool(new_unit_info, "Service", "X-RestartIfChanged", true)
             || parse_systemd_bool(new_unit_info, "Unit", "RefuseManualStop", false)
             || parse_systemd_bool(new_unit_info, "Unit", "X-OnlyManualStart", false)
         {
-            units_to_skip.insert(unit.to_string(), ());
+            activation_tasks.add(unit, ActivationAction::Skip);
         } else {
             // It doesn't make sense to stop and start non-services because they can't have
             // ExecStop=
@@ -573,13 +681,9 @@ fn handle_modified_unit(
                 || !unit.ends_with(".service")
             {
                 // This unit should be restarted instead of stopped and started.
-                units_to_restart.insert(unit.to_string(), ());
-                record_unit(RESTART_LIST_FILE, unit);
+                activation_tasks.add(unit, ActivationAction::Restart);
                 // Remove from units to reload so we don't restart and reload
-                if units_to_reload.contains_key(unit) {
-                    units_to_reload.remove(unit);
-                    unrecord_unit(RELOAD_LIST_FILE, unit);
-                }
+                activation_tasks.remove(unit, ActivationAction::Reload);
             } else {
                 // If this unit is socket-activated, then stop the socket unit(s) as well, and
                 // restart the socket(s) instead of the service.
@@ -608,29 +712,23 @@ fn handle_modified_unit(
                             // We can now be sure this is a socket-activated unit
 
                             if use_restart_as_stop_and_start {
-                                units_to_restart.insert(socket.to_string(), ());
+                                activation_tasks.add(socket, ActivationAction::Restart);
                             } else {
-                                units_to_stop.insert(socket.to_string(), ());
+                                activation_tasks.add(socket, ActivationAction::Stop);
                             }
 
                             // Only restart sockets that actually exist in new configuration:
                             if toplevel.join("etc/systemd/system").join(socket).exists() {
                                 if use_restart_as_stop_and_start {
-                                    units_to_restart.insert(socket.to_string(), ());
-                                    record_unit(RESTART_LIST_FILE, socket);
+                                    activation_tasks.add(socket, ActivationAction::Restart);
                                 } else {
-                                    units_to_start.insert(socket.to_string(), ());
-                                    record_unit(START_LIST_FILE, socket);
+                                    activation_tasks.add(socket, ActivationAction::Start);
                                 }
 
                                 socket_activated = true;
                             }
-
                             // Remove from units to reload so we don't restart and reload
-                            if units_to_reload.contains_key(unit) {
-                                units_to_reload.remove(unit);
-                                unrecord_unit(RELOAD_LIST_FILE, unit);
-                            }
+                            activation_tasks.remove(unit, ActivationAction::Reload);
                         }
                     }
                 }
@@ -640,24 +738,19 @@ fn handle_modified_unit(
                 // we're interrupted.
                 if !socket_activated {
                     if use_restart_as_stop_and_start {
-                        units_to_restart.insert(unit.to_string(), ());
-                        record_unit(RESTART_LIST_FILE, unit);
+                        activation_tasks.add(unit, ActivationAction::Restart);
                     } else {
-                        units_to_start.insert(unit.to_string(), ());
-                        record_unit(START_LIST_FILE, unit);
+                        activation_tasks.add(unit, ActivationAction::Start);
                     }
                 }
 
                 if use_restart_as_stop_and_start {
-                    units_to_restart.insert(unit.to_string(), ());
+                    activation_tasks.add(unit, ActivationAction::Restart);
                 } else {
-                    units_to_stop.insert(unit.to_string(), ());
+                    activation_tasks.add(unit, ActivationAction::Stop);
                 }
                 // Remove from units to reload so we don't restart and reload
-                if units_to_reload.contains_key(unit) {
-                    units_to_reload.remove(unit);
-                    unrecord_unit(RELOAD_LIST_FILE, unit);
-                }
+                activation_tasks.remove(unit, ActivationAction::Reload);
             }
         }
     }
@@ -695,16 +788,14 @@ fn unrecord_unit(p: impl AsRef<Path>, unit: &str) {
     }
 }
 
-fn map_from_list_file(p: impl AsRef<Path>) -> HashMap<String, ()> {
+fn map_from_list_file(p: impl AsRef<Path>) -> HashSet<String> {
     std::fs::read_to_string(p)
         .unwrap_or_default()
         .lines()
         .filter(|line| !line.is_empty())
         .into_iter()
-        .fold(HashMap::new(), |mut acc, line| {
-            acc.insert(line.to_string(), ());
-            acc
-        })
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Debug)]
@@ -781,23 +872,6 @@ fn path_to_unit_name(bin_path: &Path, path: &str) -> String {
     };
 
     unit.trim().to_string()
-}
-
-// Returns a HashMap containing the same contents as the passed in `units`, minus the units in
-// `units_to_filter`.
-fn filter_units(
-    units_to_filter: &HashMap<String, ()>,
-    units: &HashMap<String, ()>,
-) -> HashMap<String, ()> {
-    let mut res = HashMap::new();
-
-    for (unit, _) in units {
-        if !units_to_filter.contains_key(unit) {
-            res.insert(unit.to_string(), ());
-        }
-    }
-
-    res
 }
 
 fn unit_is_active<'a>(conn: &LocalConnection, unit: &str) -> Result<bool> {
@@ -1056,13 +1130,7 @@ won't take effect until you reboot the system.
     let handler = SigHandler::Handler(handle_sigpipe);
     unsafe { signal::signal(Signal::SIGPIPE, handler) }.context("Failed to set SIGPIPE handler")?;
 
-    let mut units_to_stop = HashMap::new();
-    let mut units_to_skip = HashMap::new();
-    let mut units_to_filter = HashMap::new(); // units not shown
-
-    let mut units_to_start = map_from_list_file(START_LIST_FILE);
-    let mut units_to_restart = map_from_list_file(RESTART_LIST_FILE);
-    let mut units_to_reload = map_from_list_file(RELOAD_LIST_FILE);
+    let mut activation_tasks = ActivationTasks::new();
 
     let dbus_conn = LocalConnection::new_system().context("Failed to open dbus connection")?;
     let (systemd, logind) = new_dbus_proxies(&dbus_conn);
@@ -1155,7 +1223,7 @@ won't take effect until you reboot the system.
             {
                 let current_unit_info = parse_unit(&current_unit_file, &current_base_unit_file)?;
                 if parse_systemd_bool(Some(&current_unit_info), "Unit", "X-StopOnRemoval", true) {
-                    _ = units_to_stop.insert(unit.to_string(), ());
+                    activation_tasks.add(unit, ActivationAction::Stop);
                 }
             } else if unit.ends_with(".target") {
                 let new_unit_info = parse_unit(&new_unit_file, &new_base_unit_file)?;
@@ -1179,11 +1247,10 @@ won't take effect until you reboot the system.
                         "X-OnlyManualStart",
                         false,
                     )) {
-                        units_to_start.insert(unit.to_string(), ());
-                        record_unit(START_LIST_FILE, unit);
+                        activation_tasks.add(unit, ActivationAction::Start);
                         // Don't spam the user with target units that always get started.
                         if std::env::var("STC_DISPLAY_ALL_UNITS").as_deref() != Ok("1") {
-                            units_to_filter.insert(unit.to_string(), ());
+                            activation_tasks.add(unit, ActivationAction::Filter);
                         }
                     }
                 }
@@ -1202,7 +1269,7 @@ won't take effect until you reboot the system.
                     "X-StopOnReconfiguration",
                     false,
                 ) {
-                    units_to_stop.insert(unit.to_string(), ());
+                    activation_tasks.add(unit, ActivationAction::Stop);
                 }
             } else {
                 let current_unit_info = parse_unit(&current_unit_file, &current_base_unit_file)?;
@@ -1217,16 +1284,11 @@ won't take effect until you reboot the system.
                             &new_base_unit_file,
                             Some(&new_unit_info),
                             &current_active_units,
-                            &mut units_to_stop,
-                            &mut units_to_start,
-                            &mut units_to_reload,
-                            &mut units_to_restart,
-                            &mut units_to_skip,
+                            &mut activation_tasks,
                         )?;
                     }
-                    UnitComparison::UnequalNeedsReload if !units_to_restart.contains_key(unit) => {
-                        units_to_reload.insert(unit.clone(), ());
-                        record_unit(RELOAD_LIST_FILE, &unit);
+                    UnitComparison::UnequalNeedsReload => {
+                        activation_tasks.add(unit, ActivationAction::Reload);
                     }
                     _ => {}
                 }
@@ -1255,25 +1317,22 @@ won't take effect until you reboot the system.
                 if matches!(mountpoint.as_str(), "/" | "/nix") {
                     if current_filesystem.options != new_filesystem.options {
                         // Mount options changes, so remount it.
-                        units_to_reload.insert(unit.to_string(), ());
-                        record_unit(RELOAD_LIST_FILE, &unit)
+                        activation_tasks.add(&unit, ActivationAction::Reload);
                     } else {
                         // Don't unmount / or /nix if the device changed
-                        units_to_skip.insert(unit, ());
+                        activation_tasks.add(&unit, ActivationAction::Skip);
                     }
                 } else {
                     // Filesystem type or device changed, so unmount and mount it.
-                    units_to_restart.insert(unit.to_string(), ());
-                    record_unit(RESTART_LIST_FILE, &unit);
+                    activation_tasks.add(&unit, ActivationAction::Restart);
                 }
             } else if current_filesystem.options != new_filesystem.options {
                 // Mount options changes, so remount it.
-                units_to_reload.insert(unit.to_string(), ());
-                record_unit(RELOAD_LIST_FILE, &unit)
+                activation_tasks.add(&unit, ActivationAction::Reload);
             }
         } else {
             // Filesystem entry disappeared, so unmount it.
-            units_to_stop.insert(unit, ());
+            activation_tasks.add(&unit, ActivationAction::Stop);
         }
     }
 
@@ -1315,25 +1374,23 @@ won't take effect until you reboot the system.
     let restart_systemd = current_pid1_path != new_pid1_path
         || current_systemd_system_config != new_systemd_system_config;
 
-    let units_to_stop_filtered = filter_units(&units_to_filter, &units_to_stop);
-
     // Show dry-run actions.
     if *action == Action::DryActivate {
-        if !units_to_stop_filtered.is_empty() {
-            let mut units = units_to_stop_filtered
-                .keys()
+        if !activation_tasks.to_stop_filtered().is_empty() {
+            let mut units = activation_tasks
+                .to_stop_filtered()
                 .into_iter()
-                .map(String::as_str)
+                .map(|s| s.as_ref())
                 .collect::<Vec<&str>>();
             units.sort_by_key(|name| name.to_lowercase());
             eprintln!("would stop the following units: {}", units.join(", "));
         }
 
-        if !units_to_skip.is_empty() {
-            let mut units = units_to_skip
-                .keys()
+        if !activation_tasks.to_skip().is_empty() {
+            let mut units = activation_tasks
+                .to_skip()
                 .into_iter()
-                .map(String::as_str)
+                .map(|s| s.as_ref())
                 .collect::<Vec<&str>>();
             units.sort_by_key(|name| name.to_lowercase());
             eprintln!(
@@ -1383,7 +1440,7 @@ won't take effect until you reboot the system.
 
             // Start units if they were not active previously
             if !current_active_units.contains_key(unit) {
-                units_to_start.insert(unit.to_string(), ());
+                activation_tasks.add(unit, ActivationAction::Start);
                 continue;
             }
 
@@ -1395,11 +1452,7 @@ won't take effect until you reboot the system.
                 &new_base_unit_file,
                 None,
                 &current_active_units,
-                &mut units_to_stop,
-                &mut units_to_start,
-                &mut units_to_reload,
-                &mut units_to_restart,
-                &mut units_to_skip,
+                &mut activation_tasks,
             )?;
         }
 
@@ -1411,11 +1464,10 @@ won't take effect until you reboot the system.
             .lines()
         {
             if current_active_units.contains_key(unit)
-                && !units_to_restart.contains_key(unit)
-                && !units_to_stop.contains_key(unit)
+                && !activation_tasks.has_action(unit, ActivationAction::Restart)
+                && !activation_tasks.has_action(unit, ActivationAction::Stop)
             {
-                units_to_reload.insert(unit.to_string(), ());
-                record_unit(RELOAD_LIST_FILE, unit);
+                activation_tasks.add(unit, ActivationAction::Reload);
             }
         }
 
@@ -1426,9 +1478,9 @@ won't take effect until you reboot the system.
             eprintln!("would restart systemd");
         }
 
-        if !units_to_reload.is_empty() {
-            let mut units = units_to_reload
-                .keys()
+        if !activation_tasks.to_reload().is_empty() {
+            let mut units = activation_tasks
+                .to_reload()
                 .into_iter()
                 .map(String::as_str)
                 .collect::<Vec<&str>>();
@@ -1436,9 +1488,9 @@ won't take effect until you reboot the system.
             eprintln!("would reload the following units: {}", units.join(", "));
         }
 
-        if !units_to_restart.is_empty() {
-            let mut units = units_to_restart
-                .keys()
+        if !activation_tasks.to_restart().is_empty() {
+            let mut units = activation_tasks
+                .to_restart()
                 .into_iter()
                 .map(String::as_str)
                 .collect::<Vec<&str>>();
@@ -1446,12 +1498,11 @@ won't take effect until you reboot the system.
             eprintln!("would restart the following units: {}", units.join(", "));
         }
 
-        let units_to_start_filtered = filter_units(&units_to_filter, &units_to_start);
-        if !units_to_start_filtered.is_empty() {
-            let mut units = units_to_start_filtered
-                .keys()
+        if !activation_tasks.to_start_filtered().is_empty() {
+            let mut units = activation_tasks
+                .to_start_filtered()
                 .into_iter()
-                .map(String::as_str)
+                .map(|s| s.as_ref())
                 .collect::<Vec<&str>>();
             units.sort_by_key(|name| name.to_lowercase());
             eprintln!("would start the following units: {}", units.join(", "));
@@ -1462,18 +1513,18 @@ won't take effect until you reboot the system.
 
     log::info!("switching to system configuration {}", toplevel.display());
 
-    if !units_to_stop.is_empty() {
-        if !units_to_stop_filtered.is_empty() {
-            let mut units = units_to_stop_filtered
-                .keys()
+    if !activation_tasks.to_stop().is_empty() {
+        if !activation_tasks.to_stop_filtered().is_empty() {
+            let mut units = activation_tasks
+                .to_stop()
                 .into_iter()
-                .map(String::as_str)
+                .map(|s| s.as_ref())
                 .collect::<Vec<&str>>();
             units.sort_by_key(|name| name.to_lowercase());
             eprintln!("stopping the following units: {}", units.join(", "));
         }
 
-        for unit in units_to_stop.keys() {
+        for unit in activation_tasks.to_stop() {
             match systemd.stop_unit(unit, "replace") {
                 Ok(job_path) => {
                     let mut j = submitted_jobs.borrow_mut();
@@ -1486,11 +1537,11 @@ won't take effect until you reboot the system.
         block_on_jobs(&dbus_conn, &submitted_jobs);
     }
 
-    if !units_to_skip.is_empty() {
-        let mut units = units_to_skip
-            .keys()
+    if !activation_tasks.to_skip().is_empty() {
+        let mut units = activation_tasks
+            .to_skip()
             .into_iter()
-            .map(String::as_str)
+            .map(|s| s.as_ref())
             .collect::<Vec<&str>>();
         units.sort_by_key(|name| name.to_lowercase());
         eprintln!(
@@ -1555,8 +1606,7 @@ won't take effect until you reboot the system.
 
         // Start units if they were not active previously
         if !current_active_units.contains_key(unit) {
-            units_to_start.insert(unit.to_string(), ());
-            record_unit(START_LIST_FILE, unit);
+            activation_tasks.add(unit, ActivationAction::Start);
             continue;
         }
 
@@ -1568,11 +1618,7 @@ won't take effect until you reboot the system.
             &new_base_unit_file,
             None,
             &current_active_units,
-            &mut units_to_stop,
-            &mut units_to_start,
-            &mut units_to_reload,
-            &mut units_to_restart,
-            &mut units_to_skip,
+            &mut activation_tasks,
         )?;
     }
 
@@ -1585,11 +1631,10 @@ won't take effect until you reboot the system.
         .lines()
     {
         if current_active_units.contains_key(unit)
-            && !units_to_restart.contains_key(unit)
-            && !units_to_stop.contains_key(unit)
+            && !activation_tasks.has_action(unit, ActivationAction::Restart)
+            && !activation_tasks.has_action(unit, ActivationAction::Stop)
         {
-            units_to_reload.insert(unit.to_string(), ());
-            record_unit(RELOAD_LIST_FILE, unit);
+            activation_tasks.add(unit, ActivationAction::Reload);
         }
     }
 
@@ -1691,8 +1736,8 @@ won't take effect until you reboot the system.
     // Before reloading we need to ensure that the units are still active. They may have been
     // deactivated because one of their requirements got stopped. If they are inactive but should
     // have been reloaded, the user probably expects them to be started.
-    if !units_to_reload.is_empty() {
-        for (unit, _) in units_to_reload.clone() {
+    if !activation_tasks.to_reload().is_empty() {
+        for unit in activation_tasks.to_reload().clone() {
             if !unit_is_active(&dbus_conn, &unit)? {
                 // Figure out if we need to start the unit
                 let unit_info = parse_unit(
@@ -1702,20 +1747,18 @@ won't take effect until you reboot the system.
                 if !parse_systemd_bool(Some(&unit_info), "Unit", "RefuseManualStart", false)
                     || parse_systemd_bool(Some(&unit_info), "Unit", "X-OnlyManualStart", false)
                 {
-                    units_to_start.insert(unit.clone(), ());
-                    record_unit(START_LIST_FILE, &unit);
+                    activation_tasks.add(&unit, ActivationAction::Start);
                 }
                 // Don't reload the unit, reloading would fail
-                units_to_reload.remove(&unit);
-                unrecord_unit(RELOAD_LIST_FILE, &unit);
+                activation_tasks.remove(&unit, ActivationAction::Reload);
             }
         }
     }
 
     // Reload units that need it. This includes remounting changed mount units.
-    if !units_to_reload.is_empty() {
-        let mut units = units_to_reload
-            .keys()
+    if !activation_tasks.to_reload().is_empty() {
+        let mut units = activation_tasks
+            .to_reload()
             .into_iter()
             .map(String::as_str)
             .collect::<Vec<&str>>();
@@ -1743,9 +1786,9 @@ won't take effect until you reboot the system.
     }
 
     // Restart changed services (those that have to be restarted rather than stopped and started).
-    if !units_to_restart.is_empty() {
-        let mut units = units_to_restart
-            .keys()
+    if !activation_tasks.to_restart().is_empty() {
+        let mut units = activation_tasks
+            .to_restart()
             .into_iter()
             .map(String::as_str)
             .collect::<Vec<&str>>();
@@ -1775,18 +1818,16 @@ won't take effect until you reboot the system.
     // because some may not be dependencies of the targets (i.e., they were manually started).
     // FIXME: detect units that are symlinks to other units.  We shouldn't start both at the same
     // time because we'll get a "Failed to add path to set" error from systemd.
-    let units_to_start_filtered = filter_units(&units_to_filter, &units_to_start);
-    if !units_to_start_filtered.is_empty() {
-        let mut units = units_to_start_filtered
-            .keys()
+    if !activation_tasks.to_start_filtered().is_empty() {
+        let mut units = activation_tasks
+            .to_start_filtered()
             .into_iter()
-            .map(String::as_str)
             .collect::<Vec<&str>>();
         units.sort_by_key(|name| name.to_lowercase());
         eprintln!("starting the following units: {}", units.join(", "));
     }
 
-    for unit in units_to_start.keys() {
+    for unit in activation_tasks.to_start() {
         match systemd.start_unit(unit, "replace") {
             Ok(job_path) => {
                 let mut jobs = submitted_jobs.borrow_mut();
@@ -1989,22 +2030,6 @@ invalid
             assert_eq!(home_fs.device, "/dev/disk/by-partlabel/home");
             assert_eq!(home_fs.options, "defaults");
         }
-    }
-
-    #[test]
-    fn filter_units() {
-        assert_eq!(
-            super::filter_units(&HashMap::from([]), &HashMap::from([])),
-            HashMap::from([])
-        );
-
-        assert_eq!(
-            super::filter_units(
-                &HashMap::from([("foo".to_string(), ())]),
-                &HashMap::from([("foo".to_string(), ()), ("bar".to_string(), ())])
-            ),
-            HashMap::from([("bar".to_string(), ())])
-        );
     }
 
     #[test]
